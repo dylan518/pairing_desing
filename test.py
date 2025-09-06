@@ -1,6 +1,5 @@
-# Rerun: embed_dim × τ grids across multiple sizes for NK and Trap,
-# generating labeled tables in the format `nk_[n_bits]` and `trap_[n_bits]`.
-# Equal-offspring GA only (fecundity-weighted variant removed).
+# Rerun: embed_dim × τ grids for a suite of continuous optimization problems.
+# Equal-offspring GA only. Subset of 4 problems across trait dimensions {16,32,64,128}.
 #
 # Config kept light for speed: seeds=[0,1], gens=40, embed_dims=[0,1,2,3,5,8], taus=[0.0,0.1,0.4,0.7,1.0]
 # Tasks: NK sizes n_bits ∈ {32,48,64} with K=8; Trap sizes n_bits ∈ {50,100}.
@@ -17,7 +16,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 # Equal-offspring GA (moved to separate module)
 from equal_ga import FWSMConfigEq, FWSMGAEqualOffspring
-from problems import make_problem
+from problems import make_problem, ComprehensiveTestProblems
 
 # ---------- Utility: output & display helpers ----------
 
@@ -67,18 +66,29 @@ def _zscore(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 # ---------- Tasks now imported from problems.py ----------
 
 # ---------- Runner ----------
-def _run_single(task_label: str, k: int, tau: float, seed: int, gens: int = 40):
+def _derive_seed(task_label: str, k: int, tau: float, base_seed: int, trait_dim: int) -> int:
+    """Deterministically derive a unique seed per (task, D, k, tau, base_seed).
+
+    Ensures fairness across settings (e.g., k=0) by varying the RNG even when
+    tau has no algorithmic effect.
+    """
+    import hashlib
+    payload = f"{task_label}|D={trait_dim}|k={k}|tau={tau:.6f}|s={base_seed}".encode()
+    h = hashlib.md5(payload).digest()
+    return int.from_bytes(h[:4], byteorder="little", signed=False)
+def _run_single(task_label: str, k: int, tau: float, seed: int, gens: int = 40, trait_dim: int = 48):
     """Run one GA trial for the given (task, k, tau, seed).
 
     Rebuilds the task deterministically inside the worker to avoid pickling
     closures across processes.
     """
-    trait_dim, fitness_fn = make_problem(task_label)
+    trait_dim, fitness_fn = make_problem(task_label, trait_dim=trait_dim)
+    run_seed = _derive_seed(task_label, k, tau, seed, trait_dim)
     cfg = FWSMConfigEq(
         pop_size=60, gens=gens, trait_dim=trait_dim,
         embed_dim=k, tau=max(tau, 1e-8),
         sigma_traits=0.22, sigma_embed=0.05,
-        child_budget=60, seed=seed,
+        child_budget=60, seed=run_seed,
     )
     ga = FWSMGAEqualOffspring(cfg)
     hist = ga.fit(fitness_fn)
@@ -88,8 +98,8 @@ def _run_single(task_label: str, k: int, tau: float, seed: int, gens: int = 40):
     }
 
 
-def run_grid(task_label: str, embed_dims, taus, seeds, gens=40, max_workers: int | None = None):
-    trait_dim, fitness_fn = make_problem(task_label)
+def run_grid(task_label: str, embed_dims, taus, seeds, gens=40, max_workers: int | None = None, trait_dim: int = 48):
+    trait_dim, _ = make_problem(task_label, trait_dim=trait_dim)
     records = []
     # Choose worker count
     if max_workers is None:
@@ -99,7 +109,7 @@ def run_grid(task_label: str, embed_dims, taus, seeds, gens=40, max_workers: int
             futures = []
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 for seed in seeds:
-                    futures.append(ex.submit(_run_single, task_label, int(k), float(tau), int(seed), int(gens)))
+                    futures.append(ex.submit(_run_single, task_label, int(k), float(tau), int(seed), int(gens), int(trait_dim)))
                 results = []
                 for fut in as_completed(futures):
                     results.append(fut.result())
@@ -108,6 +118,7 @@ def run_grid(task_label: str, embed_dims, taus, seeds, gens=40, max_workers: int
             mean_curve = np.mean(curves, axis=0)
             records.append({
                 "task": task_label,
+                "trait_dim": trait_dim,
                 "embed_dim": k,
                 "tau": tau,
                 "final_best": float(finals.mean()),
@@ -119,24 +130,28 @@ def run_grid(task_label: str, embed_dims, taus, seeds, gens=40, max_workers: int
 
 embed_dims = [0,1,2,3,5,8]
 taus = [0.0, 0.1, 0.4, 0.7, 1.0]
-seeds = [0,1]
+seeds = [0,1,2,3,4,5]
 gens = 40
-tasks = ["nk_32","nk_48","nk_64","trap_50","trap_100"]
+trait_dims = [16, 32, 64, 128]
+# Subset of 4 representative problems
+tasks = ["Sphere", "Rosenbrock", "Rastrigin", "Ackley"]
 
 def main():
     all_dfs = []
-    for task in tasks:
-        df = run_grid(task, embed_dims, taus, seeds, gens=gens)
-        all_dfs.append(df)
-        title = f"Equal-offspring {task} (final_best)"
-        csv_path = OUTPUT_DIR / f"equal_{task}.csv"
-        df.to_csv(csv_path, index=False)
-        heatmap_path = OUTPUT_DIR / f"equal_{task}_heatmap.png"
-        save_heatmap_png(title, df, heatmap_path)
+    for D in trait_dims:
+        for task in tasks:
+            df = run_grid(task, embed_dims, taus, seeds, gens=gens, trait_dim=D)
+            all_dfs.append(df)
+            title = f"Equal-offspring {task} (final_best), D={D}"
+            safe = task.lower().replace(" ", "_").replace("-", "_")
+            csv_path = OUTPUT_DIR / f"equal_{safe}_D{D}.csv"
+            df.to_csv(csv_path, index=False)
+            heatmap_path = OUTPUT_DIR / f"equal_{safe}_D{D}_heatmap.png"
+            save_heatmap_png(title, df, heatmap_path)
 
     # Combined summary
     combined = pd.concat(all_dfs, ignore_index=True)
-    combined_sorted = combined.sort_values(["task","embed_dim","tau"]).reset_index(drop=True)
+    combined_sorted = combined.sort_values(["task","trait_dim","embed_dim","tau"]).reset_index(drop=True)
 
     # Save combined
     combined_path = OUTPUT_DIR / "equal_all_tasks.csv"

@@ -4,19 +4,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from math import erf, sqrt
 
 
 ROOT = Path(__file__).resolve().parent
 OUT_DIR = ROOT / "outputs"
-
-
-def parse_task_info(task: str):
-    """Return (family, n_bits) for labels like 'nk_32' or 'trap_100'."""
-    if task.startswith("nk_"):
-        return "nk", int(task.split("_")[1])
-    if task.startswith("trap_"):
-        return "trap", int(task.split("_")[1])
-    raise ValueError(f"Unrecognized task label: {task}")
 
 
 def load_all_equal_csvs() -> pd.DataFrame:
@@ -31,66 +23,54 @@ def load_all_equal_csvs() -> pd.DataFrame:
         frames.append(df)
     all_df = pd.concat(frames, ignore_index=True)
     # Ensure columns exist
+    # trait_dim is optional (older runs may lack it). If missing, try to infer from filename suffix _D{D}.
     expected = {"task","embed_dim","tau","final_best"}
     missing = expected - set(all_df.columns)
     if missing:
         raise ValueError(f"Missing columns in CSVs: {missing}")
+    if "trait_dim" not in all_df.columns:
+        dims = []
+        for f, n in zip(files, range(len(files))):
+            m = re.search(r"_D(\d+)\.csv$", f.name)
+            dims.append(int(m.group(1)) if m else np.nan)
+        # broadcast per-file trait_dim across rows from that file
+        parts = []
+        row_offset = 0
+        for f, dim in zip(files, dims):
+            df = pd.read_csv(f)
+            df["trait_dim"] = dim
+            parts.append(df)
+        all_df = pd.concat(parts, ignore_index=True)
     # Derive task family and n_bits
-    fam_bits = all_df["task"].apply(parse_task_info)
-    all_df["family"] = fam_bits.apply(lambda x: x[0])
-    all_df["n_bits"] = fam_bits.apply(lambda x: x[1])
     return all_df
 
 
 def summarize_best_k(df: pd.DataFrame) -> pd.DataFrame:
-    """For each task, pick (k, tau) with max final_best; compute k/n_bits.
+    """For each task×trait_dim, pick (k, tau) with max final_best; compute k/trait_dim.
 
-    Returns columns: task, family, n_bits, best_k, best_tau, best_final_best, k_over_bits
+    Returns columns: task, trait_dim, best_k, best_tau, best_final_best, k_over_bits
     """
     rows = []
-    for task, g in df.groupby("task"):
+    for (task, D), g in df.groupby(["task","trait_dim"], dropna=False):
         idx = g["final_best"].idxmax()
         row = g.loc[idx]
         best_k = int(row["embed_dim"])
         best_tau = float(row["tau"])
         best_val = float(row["final_best"])
-        family, n_bits = parse_task_info(task)
         rows.append({
             "task": task,
-            "family": family,
-            "n_bits": n_bits,
+            "trait_dim": int(D) if not np.isnan(D) else np.nan,
             "best_k": best_k,
             "best_tau": best_tau,
             "best_final_best": best_val,
-            "k_over_bits": best_k / n_bits
+            "k_over_bits": (best_k / D) if (D and not np.isnan(D) and D>0) else np.nan
         })
-    return pd.DataFrame(rows).sort_values(["family","n_bits"]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["task","trait_dim"]).reset_index(drop=True)
 
 
 def plot_percent_vs_bits(summary: pd.DataFrame, out_path: Path) -> None:
-    plt.figure(figsize=(6.5, 4.2))
-    for fam, color, marker in [("nk", "#2563EB", "o"), ("trap", "#10B981", "s")]:
-        sub = summary[summary["family"] == fam]
-        if len(sub) == 0:
-            continue
-        plt.scatter(sub["n_bits"], 100*sub["k_over_bits"], c=color, marker=marker, label=fam.upper(), s=70, edgecolor="white")
-
-    # naive trendline across all points
-    x = summary["n_bits"].values.astype(float)
-    y = (100*summary["k_over_bits"].values).astype(float)
-    if len(x) >= 2 and np.ptp(x) > 0:
-        coef = np.polyfit(x, y, deg=1)
-        xs = np.linspace(x.min()-2, x.max()+2, 100)
-        ys = coef[0]*xs + coef[1]
-        plt.plot(xs, ys, color="#6B7280", linestyle="--", linewidth=1.5, label="linear trend")
-
-    plt.xlabel("genome length (bits)")
-    plt.ylabel("best embedding as % of genome (100·k/D)")
-    plt.title("Heuristic: best k as a percentage of genome size")
-    plt.legend(frameon=False)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
+    # (Deprecated in simplified run: keep stub for compatibility.)
+    pass
 
 
 def main():
@@ -98,16 +78,81 @@ def main():
     summary = summarize_best_k(df)
     out_csv = OUT_DIR / "analysis_k_ratio_summary.csv"
     summary.to_csv(out_csv, index=False)
+    # Global linear fit with intercept: k = a·D + b
+    all_sub = summary.dropna(subset=["trait_dim","best_k"]) 
+    x_all = all_sub["trait_dim"].values.astype(float)
+    y_all = all_sub["best_k"].values.astype(float)
+    n_all = len(x_all)
+    xm, ym = x_all.mean(), y_all.mean()
+    sxx = np.sum((x_all - xm)**2)
+    sxy = np.sum((x_all - xm) * (y_all - ym))
+    a = sxy / sxx if sxx > 0 else 0.0
+    b = ym - a * xm
+    yhat_all = a * x_all + b
+    ss_res = np.sum((y_all - yhat_all)**2)
+    ss_tot = np.sum((y_all - ym)**2)
+    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else 0.0
+    se = np.sqrt(ss_res / (n_all - 2)) if n_all > 2 else np.inf
+    se_a = se / np.sqrt(sxx) if sxx > 0 else np.inf
+    t_stat = a / se_a if se_a > 0 else np.nan
+    p_val = 2 * (1 - 0.5 * (1 + erf(abs(t_stat) / sqrt(2)))) if np.isfinite(t_stat) else np.nan
+    # Standalone global linear figure (scatter per task + line k=a·D+b)
+    fig2, ax2 = plt.subplots(figsize=(6.4, 4.2))
+    cmap = plt.get_cmap("tab10")
+    for i, t in enumerate(sorted(summary["task"].unique())):
+        sub = summary[summary["task"] == t].dropna(subset=["trait_dim","best_k"])
+        if len(sub) == 0:
+            continue
+        ax2.scatter(sub["trait_dim"], sub["best_k"], s=36, c=[cmap(i%10)], edgecolor="white", label=t)
+    xs2 = np.linspace(x_all.min(), x_all.max(), 200)
+    ax2.plot(xs2, a * xs2 + b, color="#111827", linestyle="-", linewidth=2, label=f"k = {a:.3f}·D + {b:.2f}")
+    ax2.set_xlabel("genome length D (bits)")
+    ax2.set_ylabel("optimal embedding size k (bits)")
+    ax2.set_title(f"Global linear fit (R²={r2:.3f}, p={p_val:.2g})")
+    ax2.legend(frameon=False, ncol=2)
+    fig2.tight_layout()
+    global_fig = OUT_DIR / "analysis_k_global_linear.png"
+    fig2.savefig(global_fig, dpi=200)
+    plt.close(fig2)
 
-    scatter_path = OUT_DIR / "analysis_k_ratio_scatter.png"
-    plot_percent_vs_bits(summary, scatter_path)
+    # Save global linear stats
+    global_csv = OUT_DIR / "analysis_k_global_linear.csv"
+    pd.DataFrame([{"slope_a": a, "intercept_b": b, "r2": r2, "p": p_val, "n": int(n_all)}]).to_csv(global_csv, index=False)
 
     # Print quick console summary
     print("Saved:")
     print(f"- summary CSV: {out_csv}")
-    print(f"- scatter:     {scatter_path}")
+    print(f"- global linear: {global_csv}")
+    print(f"- global fig:  {global_fig}")
     print()
     print(summary.to_string(index=False))
+    print()
+    print(f"Global linear fit: k = a·D + b with a={a:.4f}, b={b:.3f}, R2={r2:.3f}, p={p_val:.4g}, n={n_all}")
+
+    # New: distribution of best k and best tau overall and per task
+    dist_k = summary.groupby("best_k").size().reset_index(name="count").sort_values("best_k")
+    dist_tau = summary.groupby("best_tau").size().reset_index(name="count").sort_values("best_tau")
+    dist_task_k = summary.groupby(["task","best_k"]).size().reset_index(name="count")
+    dist_task_tau = summary.groupby(["task","best_tau"]).size().reset_index(name="count")
+    dist_k.to_csv(OUT_DIR / "best_k_distribution.csv", index=False)
+    dist_tau.to_csv(OUT_DIR / "best_tau_distribution.csv", index=False)
+    dist_task_k.to_csv(OUT_DIR / "best_k_distribution_by_task.csv", index=False)
+    dist_task_tau.to_csv(OUT_DIR / "best_tau_distribution_by_task.csv", index=False)
+
+    # Plots: bar charts for global distributions
+    def _bar(df_plot, xcol, ycol, title, out_name):
+        plt.figure(figsize=(6,3.2))
+        plt.bar(df_plot[xcol].astype(str), df_plot[ycol].values, color="#4F46E5")
+        plt.xlabel(xcol)
+        plt.ylabel("count")
+        plt.title(title)
+        plt.tight_layout()
+        p = OUT_DIR / out_name
+        plt.savefig(p, dpi=200)
+        plt.close()
+
+    _bar(dist_k, "best_k", "count", "Distribution of best embedding k (winners)", "best_k_distribution.png")
+    _bar(dist_tau, "best_tau", "count", "Distribution of best tau (winners)", "best_tau_distribution.png")
 
 
 if __name__ == "__main__":

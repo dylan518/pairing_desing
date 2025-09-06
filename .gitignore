@@ -1,0 +1,15 @@
+# Outputs and artifacts
+outputs/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
